@@ -1,0 +1,40 @@
+services:
+  app:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    image: hyperion-dev:latest
+    working_dir: /workspace
+    init: true
+    # Docker's default seccomp profile does not whitelist io_uring syscalls
+    # (they hit defaultAction ERRNO => EPERM). Use a profile that is the
+    # default plus io_uring allowed. Compose resolves the relative path and
+    # passes an absolute path to the daemon.
+    security_opt:
+      - seccomp=./seccomp.json
+    # Required to raise the memlock rlimit for io_uring.
+    cap_add:
+      - SYS_RESOURCE
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    volumes:
+      # Source tree (read-write so cargo can create target/).
+      - .:/workspace
+      # Persist the cargo registry and the prebuilt V8 archive across runs.
+      # Deliberately NOT mounting over the whole $CARGO_HOME: /usr/local/cargo/bin
+      # holds the rustup cargo/rustc shims from the base image.
+      - cargo-registry:/usr/local/cargo/registry
+      - rusty-v8:/usr/local/cargo/.rusty_v8
+      # Persist build artifacts.
+      - target-dir:/workspace/target
+    ulimits:
+      # io_uring needs >= 512 KiB of locked memory per executor.
+      # 8 MiB headroom for future multi-shard executors.
+      memlock:
+        soft: 8388608
+        hard: 8388608
+
+volumes:
+  cargo-registry:
+  rusty-v8:
+  target-dir:

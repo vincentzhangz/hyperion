@@ -1,0 +1,75 @@
+name: ci
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  rust:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Build and test in the io_uring image
+        run: |
+          docker compose build app
+          docker compose run --rm app cargo fmt --all -- --check
+          docker compose run --rm app cargo clippy --workspace --all-targets -- -D warnings
+          docker compose run --rm app cargo test --workspace -j 1 -- --test-threads=1
+          docker compose run --rm app cargo build --release -p hyperion-cli
+
+  container:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Production image (build only)
+        run: docker build -f Dockerfile.prod -t hyperion:ci .
+
+  dashboard:
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+          cache: npm
+          cache-dependency-path: crates/hyperion-dashboard/frontend/package-lock.json
+      - name: Install, test, and build dashboard
+        working-directory: crates/hyperion-dashboard/frontend
+        run: |
+          npm ci
+          npm test
+          npm run build
+      - name: Committed dist matches source
+        run: git diff --exit-code -- crates/hyperion-dashboard/frontend/dist
+      - name: Start Hyperion for Playwright
+        run: |
+          docker compose build app
+          docker compose run --rm app cargo build -p hyperion-cli
+          docker compose run --rm -d --name hyperion-e2e -p 9222:9222 \
+            -e HYPERION_AUTH_TOKEN=e2etoken \
+            -e HYPERION_ALLOW_PRIVATE_NETWORK=true \
+            app cargo run -p hyperion-cli -- serve 0.0.0.0:9222 --preview
+          for i in $(seq 1 90); do
+            if curl -fsS http://127.0.0.1:9222/health/live >/dev/null; then
+              exit 0
+            fi
+            sleep 5
+          done
+          echo "Hyperion did not become live"
+          docker logs hyperion-e2e || true
+          exit 1
+      - name: Playwright smoke
+        working-directory: crates/hyperion-dashboard/frontend
+        env:
+          HYPERION_E2E: "1"
+          HYPERION_AUTH_TOKEN: e2etoken
+          HYPERION_DASHBOARD_URL: http://127.0.0.1:9222
+        run: |
+          npx playwright install --with-deps chromium
+          npx playwright test
+      - name: Stop e2e server
+        if: always()
+        run: docker rm -f hyperion-e2e || true

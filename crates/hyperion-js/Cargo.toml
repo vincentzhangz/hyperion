@@ -1,0 +1,16 @@
+[package]
+name = "hyperion-js"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "V8 JavaScript runtime on a worker thread with a Glommio op bridge"
+
+[dependencies]
+v8 = "152"
+
+[dev-dependencies]
+serde_json = "1"
+
+[lints]
+workspace = true

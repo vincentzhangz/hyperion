@@ -1,0 +1,71 @@
+# Production-shaped example: pull a signed GHCR image, Postgres, and MinIO.
+# TLS still belongs on a reverse proxy in front of this stack.
+#
+# Copy .env.example to .env and set every required secret before `compose up`.
+# Compose fails closed if HYPERION_AUTH_TOKEN or HYPERION_ENCRYPTION_KEY is unset.
+
+services:
+  postgres:
+    image: postgres:16-alpine
+    environment:
+      POSTGRES_USER: hyperion
+      POSTGRES_PASSWORD: ${POSTGRES_PASSWORD:?set POSTGRES_PASSWORD in .env}
+      POSTGRES_DB: hyperion
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+
+  minio:
+    image: minio/minio:latest
+    command: server /data --console-address ":9001"
+    environment:
+      MINIO_ROOT_USER: ${MINIO_ROOT_USER:?set MINIO_ROOT_USER in .env}
+      MINIO_ROOT_PASSWORD: ${MINIO_ROOT_PASSWORD:?set MINIO_ROOT_PASSWORD in .env}
+    volumes:
+      - minio:/data
+
+  hyperion:
+    image: ${GHCR_IMAGE:-ghcr.io/vincentzhangz/hyperion:latest}
+    depends_on:
+      - postgres
+      - minio
+    env_file:
+      - .env
+    environment:
+      HYPERION_BIND: 0.0.0.0:9222
+      HYPERION_AUTH_TOKEN: ${HYPERION_AUTH_TOKEN:?set HYPERION_AUTH_TOKEN in .env}
+      HYPERION_ENCRYPTION_KEY: ${HYPERION_ENCRYPTION_KEY:?set HYPERION_ENCRYPTION_KEY in .env}
+      HYPERION_ALLOW_PRIVATE_NETWORK: "false"
+      HYPERION_WORKERS: "2"
+      HYPERION_V8_POOL_SIZE: "4"
+      HYPERION_POSTGRES_URL: postgres://hyperion:${POSTGRES_PASSWORD}@postgres:5432/hyperion
+      HYPERION_PROFILE_BACKEND: s3
+      HYPERION_S3_ENDPOINT: http://minio:9000
+      HYPERION_S3_BUCKET: hyperion
+      HYPERION_S3_ACCESS_KEY: ${MINIO_ROOT_USER}
+      HYPERION_S3_SECRET_KEY: ${MINIO_ROOT_PASSWORD}
+    ports:
+      - "9222:9222"
+    security_opt:
+      - seccomp=./seccomp.json
+    cap_add:
+      - SYS_RESOURCE
+    ulimits:
+      memlock:
+        soft: 8388608
+        hard: 8388608
+    read_only: true
+    tmpfs:
+      - /tmp
+    volumes:
+      - profiles:/var/lib/hyperion/profiles
+      - ./seccomp.json:/etc/hyperion/seccomp.json:ro
+    deploy:
+      resources:
+        limits:
+          cpus: "2.0"
+          memory: 4G
+
+volumes:
+  pgdata:
+  minio:
+  profiles:

@@ -1,0 +1,52 @@
+# syntax=docker/dockerfile:1.7
+
+ARG VERSION=0.1.0
+ARG REVISION=unknown
+ARG SOURCE=https://github.com/vincentzhangz/hyperion
+
+FROM node:20-bookworm AS frontend
+WORKDIR /ui
+COPY crates/hyperion-dashboard/frontend/package.json crates/hyperion-dashboard/frontend/package-lock.json ./
+RUN npm ci
+COPY crates/hyperion-dashboard/frontend ./
+RUN npm run build
+
+FROM rust:1.97-bookworm AS build
+RUN apt-get update && apt-get install -y --no-install-recommends \
+    build-essential pkg-config libglib2.0-dev libssl-dev cmake python3 ca-certificates \
+    && rm -rf /var/lib/apt/lists/*
+WORKDIR /src
+COPY . .
+COPY --from=frontend /ui/dist /src/crates/hyperion-dashboard/frontend/dist
+RUN mkdir -p /out
+RUN --mount=type=cache,target=/usr/local/cargo/registry \
+    --mount=type=cache,target=/usr/local/cargo/git \
+    --mount=type=cache,target=/src/target \
+    cargo build --release -p hyperion-cli \
+    && cp /src/target/release/hyperion /out/hyperion
+
+FROM debian:bookworm-slim
+ARG VERSION
+ARG REVISION
+ARG SOURCE
+RUN apt-get update && apt-get install -y --no-install-recommends ca-certificates libssl3 curl \
+    && rm -rf /var/lib/apt/lists/* \
+    && useradd --system --home /var/lib/hyperion --create-home --uid 10001 hyperion
+COPY --from=build /out/hyperion /usr/local/bin/hyperion
+COPY seccomp.json /etc/hyperion/seccomp.json
+USER hyperion
+WORKDIR /var/lib/hyperion
+ENV HYPERION_BIND=0.0.0.0:9222 \
+    HYPERION_PROFILE_ROOT=/var/lib/hyperion/profiles \
+    HYPERION_LOG_FORMAT=json
+EXPOSE 9222
+LABEL org.opencontainers.image.title="hyperion" \
+      org.opencontainers.image.description="Glommio/io_uring headless browser with a CDP subset" \
+      org.opencontainers.image.source="${SOURCE}" \
+      org.opencontainers.image.revision="${REVISION}" \
+      org.opencontainers.image.version="${VERSION}" \
+      org.opencontainers.image.licenses="Apache-2.0"
+HEALTHCHECK --interval=10s --timeout=3s --start-period=20s --retries=3 \
+    CMD curl -fsS http://127.0.0.1:9222/health/live >/dev/null || exit 1
+ENTRYPOINT ["/usr/local/bin/hyperion"]
+CMD ["serve", "0.0.0.0:9222", "--preview"]

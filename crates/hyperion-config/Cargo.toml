@@ -1,0 +1,16 @@
+[package]
+name = "hyperion-config"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Shared Hyperion server, security, and resource configuration"
+
+[dependencies]
+serde = { version = "1", features = ["derive"] }
+subtle = "2"
+thiserror = "2"
+url = "2"
+
+[lints]
+workspace = true

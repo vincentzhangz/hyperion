@@ -1,0 +1,27 @@
+[package]
+name = "hyperion-cli"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Hyperion command-line interface"
+
+[[bin]]
+name = "hyperion"
+path = "src/main.rs"
+
+[dependencies]
+clap = { version = "4", features = ["derive"] }
+ctrlc = "3"
+glommio = "0.9"
+hyperion-browser = { path = "../hyperion-browser" }
+hyperion-cdp = { path = "../hyperion-cdp" }
+hyperion-config = { path = "../hyperion-config" }
+hyperion-dom = { path = "../hyperion-dom" }
+hyperion-js = { path = "../hyperion-js" }
+hyperion-net = { path = "../hyperion-net" }
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter", "json"] }
+
+[lints]
+workspace = true

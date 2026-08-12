@@ -1,0 +1,99 @@
+name: stress
+
+on:
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: smoke (short) or soak (2,000 targets)
+        type: choice
+        options: [smoke, soak]
+        default: smoke
+  schedule:
+    - cron: "0 4 * * 0"
+
+permissions:
+  contents: read
+
+jobs:
+  smoke:
+    if: github.event_name == 'workflow_dispatch' && inputs.mode == 'smoke'
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Start Hyperion
+        run: |
+          docker compose build app
+          docker compose run --rm app cargo build --release -p hyperion-cli
+          docker compose run --rm -d --name hyperion-stress -p 9222:9222 \
+            -e HYPERION_AUTH_TOKEN=stresstoken \
+            -e HYPERION_ALLOW_PRIVATE_NETWORK=true \
+            -e HYPERION_MAX_TARGETS=4 \
+            app cargo run -p hyperion-cli --release -- serve 0.0.0.0:9222 --preview
+          for i in $(seq 1 90); do
+            curl -fsS http://127.0.0.1:9222/health/live && exit 0
+            sleep 5
+          done
+          docker logs hyperion-stress || true
+          exit 1
+      - name: Stress smoke
+        env:
+          HOST: 127.0.0.1:9222
+          HYPERION_AUTH_TOKEN: stresstoken
+          STRESS_ORIGIN_HOST: host.docker.internal
+        run: |
+          STRESS_MODE=smoke bash scripts/stress/run.sh smoke
+          STRESS_MODE=selftest bash scripts/stress/run.sh selftest
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress-smoke
+          path: artifacts/stress-*
+      - if: always()
+        run: docker rm -f hyperion-stress || true
+
+  soak:
+    if: github.event_name == 'schedule' || (github.event_name == 'workflow_dispatch' && inputs.mode == 'soak')
+    runs-on: ubuntu-latest
+    timeout-minutes: 180
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+      - name: Start Hyperion
+        run: |
+          docker compose build app
+          docker compose run --rm app cargo build --release -p hyperion-cli
+          docker compose run --rm -d --name hyperion-soak -p 9222:9222 \
+            -e HYPERION_AUTH_TOKEN=stresstoken \
+            -e HYPERION_ALLOW_PRIVATE_NETWORK=true \
+            -e HYPERION_MAX_TARGETS=2048 \
+            -e HYPERION_WORKERS=2 \
+            -e HYPERION_V8_POOL_SIZE=4 \
+            app cargo run -p hyperion-cli --release -- serve 0.0.0.0:9222 --preview
+          for i in $(seq 1 90); do
+            curl -fsS http://127.0.0.1:9222/health/live && exit 0
+            sleep 5
+          done
+          docker logs hyperion-soak || true
+          exit 1
+      - name: Production-shaped soak
+        env:
+          HOST: 127.0.0.1:9222
+          HYPERION_AUTH_TOKEN: stresstoken
+          STRESS_MODE: soak
+          STRESS_TARGETS: "2000"
+          STRESS_HOLD_SECS: "300"
+          STRESS_ORIGIN_HOST: host.docker.internal
+        run: bash scripts/stress/run.sh soak
+      - uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: stress-soak
+          path: artifacts/stress-*
+      - if: always()
+        run: docker rm -f hyperion-soak || true

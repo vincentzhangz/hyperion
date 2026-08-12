@@ -1,0 +1,35 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/hyperion-browser",
+    "crates/hyperion-cdp",
+    "crates/hyperion-cli",
+    "crates/hyperion-config",
+    "crates/hyperion-dashboard",
+    "crates/hyperion-dom",
+    "crates/hyperion-js",
+    "crates/hyperion-metrics",
+    "crates/hyperion-net",
+    "crates/hyperion-profile",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "Apache-2.0"
+repository = "https://github.com/vincentzhangz/hyperion"
+homepage = "https://github.com/vincentzhangz/hyperion"
+authors = ["Vincent Zhang"]
+readme = "README.md"
+rust-version = "1.97"
+
+[workspace.lints.clippy]
+collapsible_if = "allow"
+field_reassign_with_default = "allow"
+if_same_then_else = "allow"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
+panic = "abort"

@@ -1,0 +1,20 @@
+[package]
+name = "hyperion-dom"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Arena-allocated DOM tree, html5ever parsing and CSS selector engine"
+
+[dependencies]
+cssparser = "0.34"
+html5ever = "0.29"
+markup5ever = "0.14"
+precomputed-hash = "0.1"
+selectors = "0.26"
+string_cache = "0.8"
+tendril = "0.4"
+typed-arena = "2"
+
+[lints]
+workspace = true

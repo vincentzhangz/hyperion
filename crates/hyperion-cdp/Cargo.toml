@@ -1,0 +1,42 @@
+[package]
+name = "hyperion-cdp"
+version.workspace = true
+edition.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Chrome DevTools Protocol server: targets, sessions, RFC6455 WebSocket transport over glommio"
+
+[dependencies]
+base64 = "0.22"
+bytes = "1"
+futures-lite = "1"
+glommio = "0.9"
+http = "1"
+hyperion-browser = { path = "../hyperion-browser" }
+hyperion-config = { path = "../hyperion-config" }
+hyperion-dashboard = { path = "../hyperion-dashboard" }
+hyperion-dom = { path = "../hyperion-dom" }
+hyperion-js = { path = "../hyperion-js" }
+hyperion-metrics = { path = "../hyperion-metrics" }
+hyperion-net = { path = "../hyperion-net" }
+hyperion-profile = { path = "../hyperion-profile" }
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha1 = "0.10"
+tracing = "0.1"
+url = "2"
+
+[dev-dependencies]
+base64 = "0.22"
+bytes = "1"
+futures-lite = "1"
+glommio = "0.9"
+http = "1"
+http-body-util = "0.1"
+hyper = { version = "1", features = ["server"] }
+hyperion-net = { path = "../hyperion-net" }
+serde_json = "1"
+sha1 = "0.10"
+
+[lints]
+workspace = true
