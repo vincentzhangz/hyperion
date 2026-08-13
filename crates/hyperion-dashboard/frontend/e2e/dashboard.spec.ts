@@ -12,7 +12,7 @@ test("operator can sign in with the bearer token", async ({ page }) => {
   await page.goto("/ui/");
   await page.getByLabel("Bearer token").fill(token);
   await page.getByRole("button", { name: "Continue" }).click();
-  await expect(page.getByRole("heading", { name: /cluster overview|hyperion/i })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Cluster overview" })).toBeVisible();
 });
 
 test("hostile preview is framed, not inlined", async ({ page }) => {
