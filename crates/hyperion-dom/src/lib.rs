@@ -7,5 +7,5 @@ pub mod dom;
 pub mod parser;
 pub mod selectors;
 
-pub use dom::{Attribute, Dom, ElementData, Node, NodeData, NodeId};
+pub use dom::{Attribute, Dom, ElementData, Node, NodeData, NodeId, PREVIEW_NODE_ID_ATTR};
 pub use parser::parse_html;

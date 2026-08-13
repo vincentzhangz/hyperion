@@ -1,5 +1,6 @@
 import { FormEvent, useCallback, useEffect, useState } from "react";
-import { api, formatMetric, profileId, type View } from "./api";
+import { api, formatMetric, isLocalProfile, profileId, type View } from "./api";
+import { ProfileBrowser } from "./ProfileBrowser";
 
 type Metrics = Record<string, number>;
 
@@ -12,10 +13,12 @@ export function App() {
   const [q, setQ] = useState("");
   const [err, setErr] = useState("");
   const [stale, setStale] = useState(false);
-  const [previewId, setPreviewId] = useState<string | null>(null);
+  const [browserProfileId, setBrowserProfileId] = useState<string | null>(null);
+  const [browserTargetId, setBrowserTargetId] = useState<string | null>(null);
   const [busy, setBusy] = useState(false);
 
   const load = useCallback(async () => {
+    if (view === "browser") return;
     try {
       let path = "/api/v1/dashboard/overview";
       if (view === "profiles") {
@@ -162,6 +165,18 @@ export function App() {
           <p className="text-[var(--warn)]">Partial/stale cluster data — some nodes unreachable.</p>
         ) : null}
 
+        {view === "browser" && browserProfileId ? (
+          <ProfileBrowser
+            csrf={csrf}
+            profileId={browserProfileId}
+            initialTargetId={browserTargetId}
+            onBack={() => {
+              setView("profiles");
+              setBrowserTargetId(null);
+            }}
+          />
+        ) : null}
+
         {view === "overview" && (
           <>
             <header className="mb-4 flex items-center justify-between gap-3">
@@ -205,7 +220,16 @@ export function App() {
                       <td className="border-b border-[var(--border)] px-2 py-2.5">{p.title}</td>
                       <td className="border-b border-[var(--border)] px-2 py-2.5">{p.url}</td>
                       <td className="border-b border-[var(--border)] px-2 py-2.5">
-                        <button className="rounded-lg bg-[var(--accent)] px-3 font-semibold text-[#041018]" onClick={() => setPreviewId(p.id)}>
+                        <button
+                          className="rounded-lg bg-[var(--accent)] px-3 font-semibold text-[#041018]"
+                          disabled={!p.profileId}
+                          onClick={() => {
+                            if (!p.profileId) return;
+                            setBrowserProfileId(p.profileId);
+                            setBrowserTargetId(p.id);
+                            setView("browser");
+                          }}
+                        >
                           Open
                         </button>
                       </td>
@@ -214,14 +238,6 @@ export function App() {
                 </tbody>
               </table>
             )}
-            {previewId ? (
-              <iframe
-                className="preview-frame mt-4 min-h-[420px] w-full rounded-lg border border-[var(--border)] bg-white"
-                title="Hostile page preview"
-                sandbox=""
-                src={`/preview/${previewId}`}
-              />
-            ) : null}
           </>
         )}
 
@@ -265,6 +281,7 @@ export function App() {
                 <tbody>
                   {profiles.map((p) => {
                     const id = profileId(p);
+                    const local = isLocalProfile(p);
                     return (
                       <tr key={id}>
                         <td className="border-b border-[var(--border)] px-2 py-2.5">{String(p.name || "")}</td>
@@ -273,6 +290,19 @@ export function App() {
                         <td className="border-b border-[var(--border)] px-2 py-2.5">{String(p.owner_node || "—")}</td>
                         <td className="border-b border-[var(--border)] px-2 py-2.5">
                           <div className="flex flex-wrap gap-2">
+                            <button
+                              data-testid="open-browser"
+                              className="rounded-lg bg-[var(--accent)] px-3 font-semibold text-[#041018] disabled:opacity-40"
+                              disabled={!local}
+                              title={local ? "Open interactive DOM mirror" : "Remote-owned profile"}
+                              onClick={() => {
+                                setBrowserProfileId(id);
+                                setBrowserTargetId(null);
+                                setView("browser");
+                              }}
+                            >
+                              Open browser
+                            </button>
                             <button className="rounded-lg border border-[var(--border)] px-3" onClick={() => void profileAction("flush", id)}>
                               Flush
                             </button>

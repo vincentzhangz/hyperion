@@ -50,4 +50,4 @@ Persistent profiles encrypt snapshots (ChaCha20-Poly1305) to local disk or S3. P
 
 ## Dashboard
 
-`/ui/` is served from the same bind as CDP. Production assets are built with Vite (`base: /ui/`) into unhashed `app.js` / `app.css` so the Rust crate can embed them. Hostile page HTML is never inlined; previews use a sandboxed iframe of `/preview/<id>`.
+`/ui/` is served from the same bind as CDP. Production assets are built with Vite (`base: /ui/`) into unhashed `app.js` / `app.css` so the Rust crate can embed them. Hostile page HTML is never inlined into the operator DOM; the profile browser renders snapshots in a scriptless `srcdoc` iframe and talks to `/preview/live/<id>`.

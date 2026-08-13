@@ -3,10 +3,18 @@
 use std::cell::RefCell;
 use std::rc::Rc;
 
-use hyperion_dom::{Dom, NodeId};
+use hyperion_dom::{Dom, NodeData, NodeId};
 use hyperion_js::{EvalOutcome, JsRuntime, PropertyDescriptor};
 
 use crate::domjs::{DomBridgeState, NodeIdMap, PageEnv, make_dom_op_handler};
+
+/// Result of a node-addressed preview/CDP interaction.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InteractionOutcome {
+    Applied,
+    Stale,
+    Navigate(String),
+}
 
 /// Op id for the multiplexed DOM bridge (`document` / `Element` methods).
 pub const DOM_OP_ID: u32 = 1;
@@ -257,10 +265,163 @@ impl Page {
         self.dom.borrow().text_content(id)
     }
 
-    /// Snapshot HTML for the live preview (document outerHTML).
+    /// Snapshot HTML for the live preview (document outerHTML with stable node ids).
     pub fn snapshot_html(&self) -> String {
+        self.ensure_dom_ids();
         let dom = self.dom.borrow();
-        dom.outer_html(dom.document())
+        let ids = self.node_ids.borrow();
+        dom.outer_html_annotated(dom.document(), |n| ids.get(n))
+    }
+
+    /// Dispatch mouseover/enter/move to `node_id`, leaving the previous hover target.
+    pub fn dispatch_hover(&self, node_id: i32) -> Result<InteractionOutcome, String> {
+        if self.resolve_node_id(node_id).is_none() {
+            return Ok(InteractionOutcome::Stale);
+        }
+        let prev = self.bridge.borrow().hovered;
+        if prev == Some(node_id) {
+            let _ = self.eval_flag(&format!(
+                "(function(){{var n=__hyperion_wrapNode({node_id});if(!n)return 'stale';n.dispatchEvent({{type:'mousemove',bubbles:true}});return 'ok';}})()"
+            ))?;
+            return Ok(InteractionOutcome::Applied);
+        }
+        if let Some(old) = prev {
+            let _ = self.evaluate_js(&format!(
+                "(function(){{var n=__hyperion_wrapNode({old});if(n){{n.dispatchEvent({{type:'mouseout',bubbles:true}});n.dispatchEvent({{type:'mouseleave',bubbles:false}});}}}})()"
+            ));
+        }
+        self.bridge.borrow_mut().hovered = Some(node_id);
+        match self.eval_flag(&format!(
+            "(function(){{var n=__hyperion_wrapNode({node_id});if(!n)return 'stale';n.dispatchEvent({{type:'mouseover',bubbles:true}});n.dispatchEvent({{type:'mouseenter',bubbles:false}});n.dispatchEvent({{type:'mousemove',bubbles:true}});return 'ok';}})()"
+        ))? {
+            InteractionOutcome::Stale => Ok(InteractionOutcome::Stale),
+            other => Ok(other),
+        }
+    }
+
+    /// Focus `node_id`, firing blur on the previous focused node.
+    pub fn dispatch_focus(&self, node_id: i32) -> Result<InteractionOutcome, String> {
+        if self.resolve_node_id(node_id).is_none() {
+            return Ok(InteractionOutcome::Stale);
+        }
+        let prev = self.focused_node_id();
+        if prev == Some(node_id) {
+            return Ok(InteractionOutcome::Applied);
+        }
+        if let Some(old) = prev {
+            let _ = self.evaluate_js(&format!(
+                "(function(){{var n=__hyperion_wrapNode({old});if(n){{n.dispatchEvent({{type:'blur',bubbles:false}});n.dispatchEvent({{type:'focusout',bubbles:true}});}}}})()"
+            ));
+        }
+        self.set_focused_node_id(Some(node_id));
+        self.eval_flag(&format!(
+            "(function(){{var n=__hyperion_wrapNode({node_id});if(!n)return 'stale';n.focus();n.dispatchEvent({{type:'focus',bubbles:false}});n.dispatchEvent({{type:'focusin',bubbles:true}});return 'ok';}})()"
+        ))
+    }
+
+    /// Click `node_id`. Anchor default actions return [`InteractionOutcome::Navigate`].
+    pub fn dispatch_click(&self, node_id: i32) -> Result<InteractionOutcome, String> {
+        if self.resolve_node_id(node_id).is_none() {
+            return Ok(InteractionOutcome::Stale);
+        }
+        let _ = self.dispatch_hover(node_id)?;
+        let _ = self.dispatch_focus(node_id)?;
+        let result = self.eval_flag(&format!(
+            "(function(){{var n=__hyperion_wrapNode({node_id});if(!n)return 'stale';n.dispatchEvent({{type:'mousedown',bubbles:true}});n.dispatchEvent({{type:'mouseup',bubbles:true}});if(n.click)n.click();else n.dispatchEvent({{type:'click',bubbles:true}});return 'ok';}})()"
+        ))?;
+        if result == InteractionOutcome::Stale {
+            return Ok(result);
+        }
+        if let Some(url) = self.anchor_navigation_url(node_id) {
+            return Ok(InteractionOutcome::Navigate(url));
+        }
+        Ok(InteractionOutcome::Applied)
+    }
+
+    /// Insert `text` into the focused (or specified) node and fire input/change.
+    pub fn dispatch_text(
+        &self,
+        node_id: Option<i32>,
+        text: &str,
+    ) -> Result<InteractionOutcome, String> {
+        let Some(id) = node_id.or_else(|| self.focused_node_id()) else {
+            return Ok(InteractionOutcome::Applied);
+        };
+        if self.resolve_node_id(id).is_none() {
+            return Ok(InteractionOutcome::Stale);
+        }
+        let _ = self.dispatch_focus(id)?;
+        let text_js = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into());
+        self.eval_flag(&format!(
+            "(function(){{var n=__hyperion_wrapNode({id});if(!n)return 'stale';n.value=(n.value||'')+{text_js};n.dispatchEvent({{type:'input',bubbles:true}});n.dispatchEvent({{type:'change',bubbles:true}});return 'ok';}})()"
+        ))
+    }
+
+    /// Dispatch a keyboard event to the focused (or specified) node.
+    pub fn dispatch_key(
+        &self,
+        node_id: Option<i32>,
+        event_type: &str,
+        key: &str,
+        text: &str,
+    ) -> Result<InteractionOutcome, String> {
+        let Some(id) = node_id.or_else(|| self.focused_node_id()) else {
+            return Ok(InteractionOutcome::Applied);
+        };
+        if self.resolve_node_id(id).is_none() {
+            return Ok(InteractionOutcome::Stale);
+        }
+        let ty = serde_json::to_string(event_type).unwrap_or_else(|_| "\"keydown\"".into());
+        let key_js = serde_json::to_string(key).unwrap_or_else(|_| "\"\"".into());
+        let _ = self.eval_flag(&format!(
+            "(function(){{var n=__hyperion_wrapNode({id});if(!n)return 'stale';n.dispatchEvent({{type:{ty},key:{key_js},bubbles:true}});return 'ok';}})()"
+        ))?;
+        if !text.is_empty()
+            && (event_type == "keyDown"
+                || event_type == "keydown"
+                || event_type == "rawKeyDown"
+                || event_type == "char")
+        {
+            return self.dispatch_text(Some(id), text);
+        }
+        Ok(InteractionOutcome::Applied)
+    }
+
+    /// Fire a scroll event on `node_id`. Visual scrolling stays in the operator iframe.
+    pub fn dispatch_scroll(&self, node_id: i32) -> Result<InteractionOutcome, String> {
+        if self.resolve_node_id(node_id).is_none() {
+            return Ok(InteractionOutcome::Stale);
+        }
+        self.eval_flag(&format!(
+            "(function(){{var n=__hyperion_wrapNode({node_id});if(!n)return 'stale';n.dispatchEvent({{type:'scroll',bubbles:true}});return 'ok';}})()"
+        ))
+    }
+
+    fn eval_flag(&self, source: &str) -> Result<InteractionOutcome, String> {
+        let result = self.evaluate_js(source)?;
+        let flag = result.trim().trim_matches('"');
+        if flag == "stale" {
+            Ok(InteractionOutcome::Stale)
+        } else {
+            Ok(InteractionOutcome::Applied)
+        }
+    }
+
+    fn anchor_navigation_url(&self, node_id: i32) -> Option<String> {
+        let mut cur = self.resolve_node_id(node_id);
+        while let Some(node) = cur {
+            if let NodeData::Element(e) = node.data()
+                && e.name().as_ref() == "a"
+            {
+                let href = self.dom().get_attribute(node, "href")?;
+                if href.is_empty() || href.starts_with("javascript:") || href.starts_with('#') {
+                    return None;
+                }
+                return resolve_href(self.url(), &href);
+            }
+            cur = node.parent();
+        }
+        None
     }
 
     /// Evaluate init scripts then all inline `<script>` blocks in document order.
@@ -296,4 +457,14 @@ impl Page {
     fn with_js_mut<R>(&self, f: impl FnOnce(&mut JsRuntime) -> R) -> R {
         f(&mut self.js.borrow_mut())
     }
+}
+
+fn resolve_href(base: &str, href: &str) -> Option<String> {
+    if href.starts_with("http://") || href.starts_with("https://") || href == "about:blank" {
+        return Some(href.to_owned());
+    }
+    url::Url::parse(base)
+        .ok()
+        .and_then(|u| u.join(href).ok())
+        .map(|u| u.to_string())
 }

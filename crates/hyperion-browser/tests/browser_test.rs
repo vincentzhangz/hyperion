@@ -17,9 +17,21 @@ const PAGE_HTML: &str = r#"<!DOCTYPE html>
   <body>
     <h1 id="heading">Hello, Hyperion</h1>
     <p class="note">rendered by io_uring</p>
+    <button id="btn">press</button>
+    <input id="field" value="">
+    <a id="go" href="/next">go</a>
     <script>
       globalThis.greeting = "from v8";
       globalThis.pairs = 21 * 2;
+      document.querySelector('#btn').addEventListener('click', function () {
+        document.querySelector('#heading').textContent = 'clicked';
+      });
+      document.querySelector('#btn').addEventListener('mouseover', function () {
+        globalThis.hovered = true;
+      });
+      document.querySelector('#field').addEventListener('input', function () {
+        globalThis.typed = this.value;
+      });
     </script>
   </body>
 </html>"#;
@@ -153,6 +165,94 @@ fn js_dom_mutation_updates_snapshot() {
             page.evaluate_js("document.querySelector('#heading').textContent")
                 .unwrap(),
             "mutated"
+        );
+    });
+}
+
+#[test]
+fn snapshot_html_annotates_stable_node_ids() {
+    with_page(|page| {
+        let heading = page
+            .dom()
+            .query_selector("h1#heading")
+            .unwrap()
+            .expect("heading");
+        let id = page.node_id_of(heading);
+        let snap = page.snapshot_html();
+        assert!(
+            snap.contains(&format!("data-hyperion-node-id=\"{id}\"")),
+            "annotated snapshot missing id {id}: {snap}"
+        );
+        page.evaluate_js("document.querySelector('#heading').textContent = 'still-me'")
+            .unwrap();
+        let snap2 = page.snapshot_html();
+        assert!(
+            snap2.contains(&format!("data-hyperion-node-id=\"{id}\"")),
+            "id must remain stable across text mutation: {snap2}"
+        );
+        page.evaluate_js(
+            "document.body.appendChild(document.createElement('aside')).textContent='n'",
+        )
+        .unwrap();
+        let aside = page.dom().query_selector("aside").unwrap().expect("aside");
+        let aside_id = page.node_id_of(aside);
+        assert_ne!(aside_id, id);
+        let snap3 = page.snapshot_html();
+        assert!(
+            snap3.contains(&format!("data-hyperion-node-id=\"{aside_id}\"")),
+            "new nodes get ids: {snap3}"
+        );
+    });
+}
+
+#[test]
+fn node_interactions_dispatch_and_navigate() {
+    with_page(|page| {
+        let btn = page.dom().query_selector("#btn").unwrap().unwrap();
+        let btn_id = page.node_id_of(btn);
+        assert_eq!(
+            page.dispatch_hover(btn_id).unwrap(),
+            hyperion_browser::InteractionOutcome::Applied
+        );
+        assert_eq!(
+            page.evaluate_js("String(globalThis.hovered)").unwrap(),
+            "true"
+        );
+        assert_eq!(
+            page.dispatch_click(btn_id).unwrap(),
+            hyperion_browser::InteractionOutcome::Applied
+        );
+        assert_eq!(
+            page.evaluate_js("document.querySelector('#heading').textContent")
+                .unwrap(),
+            "clicked"
+        );
+
+        let field = page.dom().query_selector("#field").unwrap().unwrap();
+        let field_id = page.node_id_of(field);
+        page.dispatch_text(Some(field_id), "hi").unwrap();
+        assert_eq!(
+            page.evaluate_js("document.querySelector('#field').value")
+                .unwrap(),
+            "hi"
+        );
+        assert_eq!(page.evaluate_js("String(globalThis.typed)").unwrap(), "hi");
+        assert_eq!(
+            page.evaluate_js("document.activeElement.id").unwrap(),
+            "field"
+        );
+
+        let link = page.dom().query_selector("#go").unwrap().unwrap();
+        let link_id = page.node_id_of(link);
+        match page.dispatch_click(link_id).unwrap() {
+            hyperion_browser::InteractionOutcome::Navigate(url) => {
+                assert!(url.ends_with("/next"), "href resolved: {url}");
+            }
+            other => panic!("expected navigate, got {other:?}"),
+        }
+        assert_eq!(
+            page.dispatch_click(9_999_999).unwrap(),
+            hyperion_browser::InteractionOutcome::Stale
         );
     });
 }

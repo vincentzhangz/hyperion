@@ -14,7 +14,7 @@ use hyperion_cdp::{CdpServer, CdpServerOptions};
 use hyperion_net::client::{HttpClient, HttpClientOptions};
 use hyperion_net::connector::GlommioStream;
 
-const PAGE_HTML: &str = "<!doctype html><html><head><title>CDP Test</title></head><body><h1 id=\"main\">Hello</h1><p class=\"x\">one</p><p class=\"x\">two</p></body></html>";
+const PAGE_HTML: &str = "<!doctype html><html><head><title>CDP Test</title></head><body><h1 id=\"main\">Hello</h1><button id=\"btn\">press</button><p class=\"x\">one</p><p class=\"x\">two</p><script>document.querySelector('#btn').addEventListener('click',function(){document.querySelector('#main').textContent='clicked';});</script></body></html>";
 
 /// A tiny in-process HTML server so navigations don't need the network.
 struct HtmlServer;
@@ -98,14 +98,26 @@ where
 // ----------------------------------------------------------------------
 
 async fn ws_connect(addr: &str, path: &str) -> std::io::Result<(glommio::net::TcpStream, Vec<u8>)> {
+    ws_connect_headers(addr, path, &[]).await
+}
+
+async fn ws_connect_headers(
+    addr: &str,
+    path: &str,
+    extra: &[(&str, &str)],
+) -> std::io::Result<(glommio::net::TcpStream, Vec<u8>)> {
     use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
     let mut stream = glommio::net::TcpStream::connect(addr)
         .await
         .map_err(|e| std::io::Error::other(e.to_string()))?;
     let key = "dGhlIHNhbXBsZSBub25jZQ==";
-    let req = format!(
-        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n\r\n"
+    let mut req = format!(
+        "GET {path} HTTP/1.1\r\nHost: {addr}\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: {key}\r\nSec-WebSocket-Version: 13\r\n"
     );
+    for (k, v) in extra {
+        req.push_str(&format!("{k}: {v}\r\n"));
+    }
+    req.push_str("\r\n");
     stream.write_all(req.as_bytes()).await?;
 
     let mut buf = Vec::new();
@@ -1457,4 +1469,378 @@ fn target_create_uses_and_disposes_requested_browser_context() {
             .expect("browser context ids");
         assert!(context_ids.iter().all(|id| id != &context_id), "{contexts}");
     });
+}
+
+fn preview_node_id(html: &str, element_id: &str) -> i32 {
+    let needle = format!("id=\"{element_id}\"");
+    let attr_at = html
+        .find(&needle)
+        .unwrap_or_else(|| panic!("missing {needle} in {html}"));
+    let lt = html[..attr_at].rfind('<').expect("<");
+    let gt = attr_at + html[attr_at..].find('>').expect(">");
+    let tag = &html[lt..gt];
+    let key = "data-hyperion-node-id=\"";
+    let start = tag
+        .find(key)
+        .unwrap_or_else(|| panic!("missing node id on {tag}"))
+        + key.len();
+    let end = tag[start..].find('"').expect("quote");
+    tag[start..start + end].parse().expect("node id")
+}
+
+#[test]
+fn preview_input_click_updates_snapshot() {
+    with_cdp(|addr, html| async move {
+        let client = HttpClient::new(HttpClientOptions::default());
+        let page_url = format!("http://{html}/");
+        let resp = client
+            .fetch(&format!("http://{addr}/json/new?url={page_url}"))
+            .await
+            .unwrap();
+        let desc: Value = serde_json::from_slice(&resp.body).unwrap();
+        let id = desc["id"].as_str().unwrap().to_owned();
+
+        let (mut preview, mut leftover) =
+            ws_connect(&addr.to_string(), &format!("/preview/live/{id}"))
+                .await
+                .unwrap();
+        let snap = ws_read_frame(&mut preview, &mut leftover, Duration::from_secs(5))
+            .await
+            .expect("snapshot");
+        assert_eq!(snap["type"], "snapshot");
+        let html = snap["html"].as_str().unwrap();
+        let btn = preview_node_id(html, "btn");
+        let generation = snap["generation"].as_u64().unwrap_or(0);
+
+        ws_send_text(
+            &mut preview,
+            &json!({
+                "type": "input",
+                "id": 1,
+                "generation": generation,
+                "nodeId": btn,
+                "action": "click"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+
+        let mut saw = false;
+        for _ in 0..20 {
+            let frame = ws_read_frame(&mut preview, &mut leftover, Duration::from_secs(2)).await;
+            let Some(frame) = frame else { break };
+            if frame["type"] == "ack" && frame["id"] == 1 {
+                continue;
+            }
+            if frame["type"] == "snapshot"
+                && frame["html"].as_str().unwrap_or("").contains("clicked")
+            {
+                saw = true;
+                break;
+            }
+        }
+        assert!(saw, "preview click did not update DOM");
+    });
+}
+
+#[test]
+fn preview_stale_node_returns_refreshable_error() {
+    with_cdp(|addr, html| async move {
+        let client = HttpClient::new(HttpClientOptions::default());
+        let page_url = format!("http://{html}/");
+        let resp = client
+            .fetch(&format!("http://{addr}/json/new?url={page_url}"))
+            .await
+            .unwrap();
+        let desc: Value = serde_json::from_slice(&resp.body).unwrap();
+        let id = desc["id"].as_str().unwrap().to_owned();
+        let (mut preview, mut leftover) =
+            ws_connect(&addr.to_string(), &format!("/preview/live/{id}"))
+                .await
+                .unwrap();
+        let snap = ws_read_frame(&mut preview, &mut leftover, Duration::from_secs(5))
+            .await
+            .expect("snapshot");
+        let generation = snap["generation"].as_u64().unwrap_or(0);
+        ws_send_text(
+            &mut preview,
+            &json!({
+                "type": "input",
+                "id": 2,
+                "generation": generation,
+                "nodeId": 9_999_999,
+                "action": "click"
+            })
+            .to_string(),
+        )
+        .await
+        .unwrap();
+        let mut saw = false;
+        for _ in 0..10 {
+            let frame = ws_read_frame(&mut preview, &mut leftover, Duration::from_secs(2)).await;
+            let Some(frame) = frame else { break };
+            if frame["type"] == "error" && frame["code"] == "stale_node" {
+                assert_eq!(frame["refresh"], true);
+                saw = true;
+                break;
+            }
+        }
+        assert!(saw, "expected stale_node error");
+    });
+}
+
+#[test]
+fn preview_csrf_required_for_session_input() {
+    with_cdp_config(
+        |c| {
+            c.auth_token = Some("dashboard-secret-token-value!!".into());
+        },
+        |cdp_addr, html| async move {
+            let (status, head, body) = http_exchange(
+                cdp_addr,
+                "POST",
+                "/api/v1/dashboard/login",
+                &[("Authorization", "Bearer dashboard-secret-token-value!!")],
+                "{}",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let json: Value = serde_json::from_str(&body).unwrap();
+            let csrf = json["csrf"].as_str().unwrap().to_owned();
+            let cookie = head
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().split(';').next().unwrap().to_owned())
+                .expect("session cookie");
+
+            let page_url = format!("http://{html}/");
+            let (status, _, body) = http_exchange(
+                cdp_addr,
+                "GET",
+                &format!("/json/new?url={page_url}"),
+                &[("Cookie", cookie.as_str())],
+                "",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let desc: Value = serde_json::from_str(&body).unwrap();
+            let id = desc["id"].as_str().unwrap().to_owned();
+
+            let (mut preview, mut leftover) = ws_connect_headers(
+                &cdp_addr.to_string(),
+                &format!("/preview/live/{id}"),
+                &[("Cookie", cookie.as_str())],
+            )
+            .await
+            .unwrap();
+            let _ = ws_read_frame(&mut preview, &mut leftover, Duration::from_secs(5)).await;
+            ws_send_text(
+                &mut preview,
+                &json!({
+                    "type": "input",
+                    "id": 3,
+                    "generation": 1,
+                    "nodeId": 1,
+                    "action": "click"
+                })
+                .to_string(),
+            )
+            .await
+            .unwrap();
+            let mut saw_csrf = false;
+            for _ in 0..8 {
+                let frame =
+                    ws_read_frame(&mut preview, &mut leftover, Duration::from_secs(2)).await;
+                let Some(frame) = frame else { break };
+                if frame["type"] == "error" && frame["code"] == "csrf" {
+                    saw_csrf = true;
+                    break;
+                }
+            }
+            assert!(saw_csrf, "session preview input requires csrf hello");
+
+            ws_send_text(
+                &mut preview,
+                &json!({ "type": "hello", "csrf": csrf }).to_string(),
+            )
+            .await
+            .unwrap();
+            let mut hello_ok = false;
+            for _ in 0..8 {
+                let frame =
+                    ws_read_frame(&mut preview, &mut leftover, Duration::from_secs(2)).await;
+                let Some(frame) = frame else { break };
+                if frame["type"] == "ack" {
+                    hello_ok = true;
+                    break;
+                }
+            }
+            assert!(hello_ok, "valid csrf hello should ack");
+        },
+    );
+}
+
+#[test]
+fn preview_wrong_origin_is_rejected() {
+    with_cdp(|addr, html| async move {
+        let client = HttpClient::new(HttpClientOptions::default());
+        let page_url = format!("http://{html}/");
+        let resp = client
+            .fetch(&format!("http://{addr}/json/new?url={page_url}"))
+            .await
+            .unwrap();
+        let desc: Value = serde_json::from_slice(&resp.body).unwrap();
+        let id = desc["id"].as_str().unwrap().to_owned();
+        use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
+        let mut stream = glommio::net::TcpStream::connect(addr.to_string())
+            .await
+            .unwrap();
+        let req = format!(
+            "GET /preview/live/{id} HTTP/1.1\r\nHost: {addr}\r\nOrigin: http://evil.example\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Key: dGhlIHNhbXBsZSBub25jZQ==\r\nSec-WebSocket-Version: 13\r\n\r\n"
+        );
+        stream.write_all(req.as_bytes()).await.unwrap();
+        let mut buf = Vec::new();
+        let mut tmp = [0u8; 512];
+        let n = stream.read(&mut tmp).await.unwrap();
+        buf.extend_from_slice(&tmp[..n]);
+        let head = String::from_utf8_lossy(&buf);
+        assert!(
+            head.starts_with("HTTP/1.1 403"),
+            "expected origin rejection: {head}"
+        );
+    });
+}
+
+#[test]
+fn dashboard_profile_targets_lifecycle() {
+    with_cdp_config(
+        |c| {
+            c.auth_token = Some("dashboard-secret-token-value!!".into());
+            c.allow_private_network = true;
+        },
+        |cdp_addr, html| async move {
+            let (status, head, body) = http_exchange(
+                cdp_addr,
+                "POST",
+                "/api/v1/dashboard/login",
+                &[("Authorization", "Bearer dashboard-secret-token-value!!")],
+                "{}",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let json: Value = serde_json::from_str(&body).unwrap();
+            let csrf = json["csrf"].as_str().unwrap().to_owned();
+            let cookie = head
+                .lines()
+                .find(|l| l.to_ascii_lowercase().starts_with("set-cookie:"))
+                .and_then(|l| l.split_once(':'))
+                .map(|(_, v)| v.trim().split(';').next().unwrap().to_owned())
+                .expect("session cookie");
+            let auth = [("Cookie", cookie.as_str()), ("x-csrf-token", csrf.as_str())];
+
+            let (status, _, body) = http_exchange(
+                cdp_addr,
+                "POST",
+                "/api/v1/dashboard/profiles?action=create&name=browser",
+                &auth,
+                "",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let created: Value = serde_json::from_str(&body).unwrap();
+            let profile_id = created["profileId"].as_str().unwrap().to_owned();
+
+            let url = format!("http://{html}/");
+            let encoded = urlencoding_minimal(&url);
+            let (status, _, body) = http_exchange(
+                cdp_addr,
+                "POST",
+                &format!(
+                    "/api/v1/dashboard/targets?action=create&profileId={profile_id}&url={encoded}"
+                ),
+                &auth,
+                "",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let target: Value = serde_json::from_str(&body).unwrap();
+            assert!(
+                target["data"]["code"].is_null() || target.get("id").is_some(),
+                "{target}"
+            );
+            let tid = target["id"].as_str().expect("target id").to_owned();
+
+            let (status, _, body) = http_exchange(
+                cdp_addr,
+                "GET",
+                &format!("/api/v1/dashboard/profiles/detail?id={profile_id}"),
+                &[("Cookie", cookie.as_str())],
+                "",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let detail: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(detail["local"], true);
+            let targets = detail["targets"].as_array().cloned().unwrap_or_default();
+            assert!(
+                targets.iter().any(|t| t["id"] == tid),
+                "detail missing target: {detail}"
+            );
+
+            let (status, _, body) = http_exchange(
+                cdp_addr,
+                "POST",
+                "/api/v1/dashboard/profiles?action=create&name=other",
+                &auth,
+                "",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let other: Value = serde_json::from_str(&body).unwrap();
+            let other_id = other["profileId"].as_str().unwrap().to_owned();
+            let (status, _, body) = http_exchange(
+                cdp_addr,
+                "POST",
+                &format!(
+                    "/api/v1/dashboard/targets?action=navigate&profileId={other_id}&id={tid}&url={encoded}"
+                ),
+                &auth,
+                "",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let mismatch: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(
+                mismatch["data"]["code"], "target_profile_mismatch",
+                "{mismatch}"
+            );
+
+            let (status, _, body) = http_exchange(
+                cdp_addr,
+                "POST",
+                &format!("/api/v1/dashboard/targets?action=close&profileId={profile_id}&id={tid}"),
+                &auth,
+                "",
+            )
+            .await;
+            assert_eq!(status, 200, "{body}");
+            let closed: Value = serde_json::from_str(&body).unwrap();
+            assert_eq!(closed["closed"], true, "{closed}");
+        },
+    );
+}
+
+fn urlencoding_minimal(s: &str) -> String {
+    let mut out = String::new();
+    for b in s.bytes() {
+        match b {
+            b'A'..=b'Z' | b'a'..=b'z' | b'0'..=b'9' | b'-' | b'_' | b'.' | b'~' => {
+                out.push(b as char)
+            }
+            _ => out.push_str(&format!("%{b:02X}")),
+        }
+    }
+    out
 }

@@ -8,6 +8,7 @@ Hyperion is operated by trusted staff against **untrusted page URLs**.
 - Comparison is constant-time (`subtle`).
 - The dashboard exchanges the bearer token for an `HttpOnly; SameSite=Strict` session cookie. `Secure` is set only when the login request carries `X-Forwarded-Proto: https` (TLS at the reverse proxy). Tokens are never placed in URLs or `localStorage`.
 - Destructive dashboard actions require the `X-CSRF-Token` header (403 otherwise). Sessions expire (`HYPERION_SESSION_TTL_SECS`).
+- Bidirectional live-preview WebSockets accept JSON commands only after a CSRF `hello` when the upgrade used a session cookie (bearer-authenticated CDP clients are unchanged). `Origin` must match the request `Host`. Preview URLs never carry bearer tokens.
 
 ## Bind fail-closed
 
@@ -33,7 +34,7 @@ Persistent snapshots are ChaCha20-Poly1305 encrypted. Keys come from `HYPERION_E
 
 ## Preview HTML
 
-Live preview and dashboard previews render untrusted HTML in a sandboxed iframe (`sandbox` without scripts/top-navigation/forms). Do not insert page HTML into the dashboard DOM.
+Live preview and the dashboard profile browser render untrusted HTML in a sandboxed iframe (`sandbox="allow-same-origin"` without scripts, forms, popups, or top-navigation). Do not insert page HTML into the dashboard DOM. Operator clicks are addressed by stable `data-hyperion-node-id` values and executed in the headless DOM, not by running mirrored scripts in the operator origin.
 
 ## Supply chain
 

@@ -13,6 +13,7 @@ use futures_lite::io::{AsyncReadExt, AsyncWriteExt};
 use glommio::channels::local_channel::{LocalReceiver, LocalSender};
 use serde_json::Value;
 
+use crate::preview::PreviewClientMsg;
 use crate::protocol::{self, ErrorObj};
 use crate::ws::{self, Frame, SharedStream, WsReader, WsWriter};
 use bytes::Bytes;
@@ -85,6 +86,13 @@ pub enum CdpRequest {
     },
     DetachPreview {
         target_id: String,
+        reply: Sender<Reply>,
+    },
+    /// Operator preview interaction (click/hover/key/scroll).
+    PreviewCommand {
+        target_id: String,
+        profile_id: Option<String>,
+        msg: PreviewClientMsg,
         reply: Sender<Reply>,
     },
     Shutdown {
@@ -245,6 +253,9 @@ impl ConnectionTask {
                     .await
             }
             Route::PreviewLive { target_id } => {
+                if !origin_allowed(&req) {
+                    return write_http(&mut self.stream, 403, "text/plain", "origin").await;
+                }
                 let Some(key) = req
                     .headers
                     .iter()
@@ -253,13 +264,25 @@ impl ConnectionTask {
                 else {
                     return Ok(());
                 };
+                let session_sid =
+                    header_value(&req, "cookie").and_then(hyperion_dashboard::session_from_cookie);
+                let csrf_required = self.config.auth_required()
+                    && bearer_token(&req).is_none()
+                    && session_sid.is_some();
                 let accept = ws::accept_key(&key);
                 let resp = format!(
                     "HTTP/1.1 101 Switching Protocols\r\nUpgrade: websocket\r\nConnection: Upgrade\r\nSec-WebSocket-Accept: {accept}\r\n\r\n"
                 );
                 write_all(&mut self.stream, resp.as_bytes()).await?;
-                self.preview_ws_loop(target_id, leftover, &reply_tx, &reply_rx)
-                    .await
+                self.preview_ws_loop(
+                    target_id,
+                    leftover,
+                    &reply_tx,
+                    &reply_rx,
+                    csrf_required,
+                    session_sid,
+                )
+                .await
             }
             Route::PreviewIndex => {
                 write_http(
@@ -553,13 +576,15 @@ impl ConnectionTask {
         Ok(())
     }
 
-    /// Preview WebSocket: push HTML snapshots and console/network deltas.
+    /// Preview WebSocket: push HTML snapshots and accept node-addressed input.
     async fn preview_ws_loop(
         self,
         target_id: String,
         leftover: Vec<u8>,
         reply_tx: &Sender<Reply>,
         reply_rx: &Receiver<Reply>,
+        csrf_required: bool,
+        session_sid: Option<String>,
     ) -> io::Result<()> {
         let (out_tx, out_rx) = new_out_channel();
         enqueue(
@@ -582,8 +607,6 @@ impl ConnectionTask {
         let mut writer = WsWriter::new(shared.clone());
         let mut reader = WsReader::new(shared.clone(), leftover);
 
-        // Fetch the initial snapshot via the browser task and write it
-        // synchronously before the reader loop so the client always sees it.
         enqueue(
             &self.cmd,
             &self.config,
@@ -619,6 +642,8 @@ impl ConnectionTask {
         })
         .detach();
 
+        let mut csrf_ok = !csrf_required;
+        let mut bound_profile: Option<String> = None;
         loop {
             let frame = match reader.read_frame().await {
                 Ok(frame) => frame,
@@ -628,11 +653,110 @@ impl ConnectionTask {
                 Frame::Ping(payload) => {
                     let _ = out_tx.try_send(OutMsg::Pong(payload));
                 }
-                Frame::Close { .. } | Frame::Text(_) | Frame::Binary(_) => {
+                Frame::Close { .. } => {
                     let _ = out_tx.try_send(OutMsg::Close);
                     break;
                 }
+                Frame::Binary(_) => {
+                    let err = crate::preview::preview_error(
+                        None,
+                        "bad_frame",
+                        "binary preview frames are not supported",
+                        false,
+                    );
+                    let _ = out_tx.try_send(OutMsg::Text(err.to_string()));
+                }
                 Frame::Pong(_) => {}
+                Frame::Text(data) => {
+                    if data.len() > 64 * 1024 {
+                        let err = crate::preview::preview_error(
+                            None,
+                            "too_large",
+                            "preview command exceeds 64KiB",
+                            false,
+                        );
+                        let _ = out_tx.try_send(OutMsg::Text(err.to_string()));
+                        continue;
+                    }
+                    let msg = match serde_json::from_slice::<PreviewClientMsg>(&data) {
+                        Ok(m) => m,
+                        Err(e) => {
+                            let err = crate::preview::preview_error(
+                                None,
+                                "bad_request",
+                                &format!("invalid preview command: {e}"),
+                                false,
+                            );
+                            let _ = out_tx.try_send(OutMsg::Text(err.to_string()));
+                            continue;
+                        }
+                    };
+                    match msg {
+                        PreviewClientMsg::Hello { csrf, profile_id } => {
+                            if csrf_required {
+                                let token = csrf.as_deref().unwrap_or("");
+                                let sid = session_sid.as_deref().unwrap_or("");
+                                if !self.dashboard.csrf_ok(sid, token) {
+                                    let err = crate::preview::preview_error(
+                                        None,
+                                        "csrf",
+                                        "invalid csrf token",
+                                        false,
+                                    );
+                                    let _ = out_tx.try_send(OutMsg::Text(err.to_string()));
+                                    csrf_ok = false;
+                                    continue;
+                                }
+                            }
+                            csrf_ok = true;
+                            bound_profile = profile_id;
+                            let ack = crate::preview::preview_ack(0, 0);
+                            let _ = out_tx.try_send(OutMsg::Text(ack.to_string()));
+                        }
+                        input @ PreviewClientMsg::Input { .. } => {
+                            let id = match &input {
+                                PreviewClientMsg::Input { id, .. } => *id,
+                                _ => 0,
+                            };
+                            if !csrf_ok {
+                                let err = crate::preview::preview_error(
+                                    Some(id),
+                                    "csrf",
+                                    "preview hello/csrf required before input",
+                                    false,
+                                );
+                                let _ = out_tx.try_send(OutMsg::Text(err.to_string()));
+                                continue;
+                            }
+                            enqueue(
+                                &self.cmd,
+                                &self.config,
+                                CdpRequest::PreviewCommand {
+                                    target_id: target_id.clone(),
+                                    profile_id: bound_profile.clone(),
+                                    msg: input,
+                                    reply: reply_tx.clone(),
+                                },
+                            )
+                            .map_err(|e| io::Error::other(e.message))?;
+                            match reply_rx.recv().await {
+                                Some(Ok(v)) => {
+                                    let _ = out_tx.try_send(OutMsg::Text(v.to_string()));
+                                }
+                                Some(Err(e)) => {
+                                    let err = crate::preview::preview_error(
+                                        Some(id),
+                                        "server",
+                                        &e.message,
+                                        false,
+                                    );
+                                    let _ = out_tx.try_send(OutMsg::Text(err.to_string()));
+                                }
+                                None => {}
+                            }
+                        }
+                    }
+                }
             }
         }
         let _ = enqueue(
@@ -918,6 +1042,18 @@ fn authorized(config: &Config, dash: &DashboardState, req: &HttpRequest) -> bool
         return true;
     }
     false
+}
+
+fn origin_allowed(req: &HttpRequest) -> bool {
+    let Some(origin) = header_value(req, "origin") else {
+        return true;
+    };
+    let Some(host) = header_value(req, "host") else {
+        return false;
+    };
+    let http = format!("http://{host}");
+    let https = format!("https://{host}");
+    origin.eq_ignore_ascii_case(&http) || origin.eq_ignore_ascii_case(&https)
 }
 
 /// Extract the `url=` query parameter, percent-decoded.

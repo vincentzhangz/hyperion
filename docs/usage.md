@@ -26,7 +26,7 @@ curl -H "Authorization: Bearer $HYPERION_AUTH_TOKEN" \
   "http://127.0.0.1:9222/json/new?url=https://example.com"
 ```
 
-The preview is a **DOM/HTML mirror** (`iframe` + `srcdoc`), not a pixel framebuffer. Relative URLs resolve via an injected `<base href>`.
+The preview is a **DOM/HTML mirror** (`iframe` + `srcdoc`), not a pixel framebuffer. Relative URLs resolve via an injected `<base href>`. The dashboard **Open browser** workspace can click, type, and scroll against that mirror using stable node IDs; it is not Chrome-accurate rendering.
 
 ## Drive with CDP (Puppeteer / Playwright style)
 

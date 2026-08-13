@@ -10,6 +10,10 @@ use std::cell::RefCell;
 
 use crate::parser::DomSink;
 
+/// Reserved preview-only attribute. Injected during annotated serialization
+/// and never written back into the live DOM.
+pub const PREVIEW_NODE_ID_ATTR: &str = "data-hyperion-node-id";
+
 #[derive(Copy, Clone, PartialEq, Eq, Hash, Debug)]
 pub struct NodeId(*const Node);
 
@@ -356,7 +360,20 @@ impl Dom {
     /// Serialize a node and its descendants to HTML (outerHTML).
     pub fn outer_html(&self, id: NodeId) -> String {
         let mut out = String::new();
-        self.serialize_node(id, &mut out);
+        self.serialize_node(id, &mut out, None);
+        out
+    }
+
+    /// Like [`outer_html`], but injects [`PREVIEW_NODE_ID_ATTR`] from `lookup`
+    /// without mutating the live DOM. Page-provided values of that attribute
+    /// are left unchanged.
+    pub fn outer_html_annotated(
+        &self,
+        id: NodeId,
+        lookup: impl Fn(NodeId) -> Option<i32>,
+    ) -> String {
+        let mut out = String::new();
+        self.serialize_node(id, &mut out, Some(&lookup));
         out
     }
 
@@ -364,7 +381,7 @@ impl Dom {
     pub fn inner_html_str(&self, id: NodeId) -> String {
         let mut out = String::new();
         for child in id.children() {
-            self.serialize_node(*child, &mut out);
+            self.serialize_node(*child, &mut out, None);
         }
         out
     }
@@ -396,11 +413,16 @@ impl Dom {
         }
     }
 
-    fn serialize_node(&self, id: NodeId, out: &mut String) {
+    fn serialize_node(
+        &self,
+        id: NodeId,
+        out: &mut String,
+        lookup: Option<&dyn Fn(NodeId) -> Option<i32>>,
+    ) {
         match id.data() {
             NodeData::Document => {
                 for child in id.children() {
-                    self.serialize_node(*child, out);
+                    self.serialize_node(*child, out, lookup);
                 }
             }
             NodeData::DocumentType { name, .. } => {
@@ -418,12 +440,26 @@ impl Dom {
                 let name = e.name().as_ref();
                 out.push('<');
                 out.push_str(name);
+                let mut has_preview_id = false;
                 for attr in &e.attrs {
                     out.push(' ');
                     out.push_str(attr.name.as_ref());
                     out.push_str("=\"");
                     escape_attr(&attr.value, out);
                     out.push('"');
+                    if attr.name.as_ref() == PREVIEW_NODE_ID_ATTR {
+                        has_preview_id = true;
+                    }
+                }
+                if !has_preview_id && let Some(lookup) = lookup {
+                    if let Some(node_id) = lookup(id) {
+                        out.push(' ');
+                        out.push_str(PREVIEW_NODE_ID_ATTR);
+                        out.push_str("=\"");
+                        let id_text = node_id.to_string();
+                        escape_attr(&id_text, out);
+                        out.push('"');
+                    }
                 }
                 if is_void_element(name) {
                     out.push('>');
@@ -431,7 +467,7 @@ impl Dom {
                 }
                 out.push('>');
                 for child in id.children() {
-                    self.serialize_node(*child, out);
+                    self.serialize_node(*child, out, lookup);
                 }
                 out.push_str("</");
                 out.push_str(name);

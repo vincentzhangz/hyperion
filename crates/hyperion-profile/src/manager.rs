@@ -177,6 +177,17 @@ impl ProfileManager {
         Ok(self.catalog.list(offset, limit, query)?)
     }
 
+    pub fn catalog_get(
+        &self,
+        id: &ProfileId,
+    ) -> Result<Option<crate::catalog::ProfileRecord>, ProfileError> {
+        Ok(self.catalog.get(id)?)
+    }
+
+    pub fn node_id(&self) -> &str {
+        &self.node_id
+    }
+
     pub fn catalog_nodes(&self) -> Result<Vec<String>, ProfileError> {
         Ok(self.catalog.nodes()?)
     }

@@ -1,6 +1,7 @@
 //! DOM parsing and selector-matching tests.
 
 use hyperion_dom::NodeData;
+use hyperion_dom::PREVIEW_NODE_ID_ATTR;
 use hyperion_dom::parse_html;
 
 #[test]
@@ -191,4 +192,58 @@ fn inner_html_reparses_after_mutation() {
     assert_eq!(dom.outer_html(ul), "<ul><li>b</li><li>c</li></ul>");
     dom.inner_html(ul, "");
     assert_eq!(dom.outer_html(ul), "<ul></ul>");
+}
+
+#[test]
+fn annotated_html_injects_stable_ids_without_mutating_dom() {
+    let dom = parse_html("<html><body><p class=\"x\">a &amp; b</p><br></body></html>");
+    let p = dom.query_selector("p").unwrap().unwrap();
+    let body = dom.query_selector("body").unwrap().unwrap();
+    let before = dom.outer_html(body);
+    assert!(
+        !before.contains(PREVIEW_NODE_ID_ATTR),
+        "plain outer HTML must stay unannotated: {before}"
+    );
+
+    let html = dom.outer_html_annotated(body, |n| {
+        if n == p {
+            Some(7)
+        } else if n == body {
+            Some(3)
+        } else {
+            Some(1)
+        }
+    });
+    assert!(
+        html.contains(&format!(
+            "<p class=\"x\" {PREVIEW_NODE_ID_ATTR}=\"7\">a &amp; b</p>"
+        )),
+        "annotated p: {html}"
+    );
+    assert!(
+        html.contains(&format!("<br {PREVIEW_NODE_ID_ATTR}=\"1\">")),
+        "void element should still receive an id: {html}"
+    );
+    assert_eq!(
+        dom.outer_html(body),
+        before,
+        "annotated serialization must not mutate the live DOM"
+    );
+}
+
+#[test]
+fn annotated_html_does_not_override_reserved_attribute() {
+    let dom = parse_html(&format!(
+        "<html><body><div {PREVIEW_NODE_ID_ATTR}=\"page-owned\">x</div></body></html>"
+    ));
+    let div = dom.query_selector("div").unwrap().unwrap();
+    let html = dom.outer_html_annotated(div, |_| Some(99));
+    assert!(
+        html.contains(&format!("{PREVIEW_NODE_ID_ATTR}=\"page-owned\"")),
+        "page-provided attribute must win: {html}"
+    );
+    assert!(
+        !html.contains(&format!("{PREVIEW_NODE_ID_ATTR}=\"99\"")),
+        "must not override reserved attribute: {html}"
+    );
 }

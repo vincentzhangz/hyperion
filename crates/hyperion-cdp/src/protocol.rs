@@ -84,6 +84,14 @@ impl ErrorObj {
         Self::new(SERVER_ERROR, message)
     }
 
+    pub fn named(code: &str, message: impl Into<String>) -> Self {
+        Self {
+            code: INVALID_PARAMS,
+            message: message.into(),
+            data: Some(serde_json::json!({ "code": code })),
+        }
+    }
+
     /// Admission-control rejection with retry guidance.
     pub fn overloaded(message: impl Into<String>) -> Self {
         Self::new(SERVER_ERROR, format!("Overloaded: {}", message.into()))

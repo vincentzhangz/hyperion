@@ -180,11 +180,7 @@
     call("focus", { nodeId: this.__nodeId });
   };
   Node.prototype.click = function () {
-    call("dispatchEvent", {
-      nodeId: this.__nodeId,
-      type: "click",
-      bubbles: true,
-    });
+    this.dispatchEvent({ type: "click", bubbles: true });
   };
   Node.prototype.addEventListener = function (type, listener) {
     if (typeof listener !== "function") return;
@@ -317,6 +313,15 @@
         }
       }
       if (t) t.textContent = String(v);
+    },
+  });
+  Object.defineProperty(Document.prototype, "activeElement", {
+    get: function () {
+      var id = call("activeElement", {}).nodeId;
+      if (id === null || id === undefined) {
+        return this.body || this.documentElement || this;
+      }
+      return wrap(id);
     },
   });
   Object.defineProperty(Document.prototype, "URL", {

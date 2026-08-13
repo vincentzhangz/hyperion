@@ -1,5 +1,47 @@
 //! Live content-preview UI: mirrors the current DOM as HTML in a client iframe.
 
+use serde::Deserialize;
+use serde_json::{Value, json};
+
+/// Client → server preview WebSocket messages.
+#[derive(Debug, Clone, Deserialize)]
+#[serde(tag = "type", rename_all = "lowercase")]
+pub enum PreviewClientMsg {
+    Hello {
+        csrf: Option<String>,
+        #[serde(default, rename = "profileId")]
+        profile_id: Option<String>,
+    },
+    Input {
+        id: i64,
+        #[serde(default)]
+        generation: u64,
+        #[serde(default, rename = "nodeId")]
+        node_id: Option<i32>,
+        action: String,
+        #[serde(default)]
+        key: Option<String>,
+        #[serde(default)]
+        text: Option<String>,
+        #[serde(default, rename = "eventType")]
+        event_type: Option<String>,
+    },
+}
+
+pub fn preview_ack(id: i64, generation: u64) -> Value {
+    json!({ "type": "ack", "id": id, "generation": generation })
+}
+
+pub fn preview_error(id: Option<i64>, code: &str, message: &str, refresh: bool) -> Value {
+    json!({
+        "type": "error",
+        "id": id,
+        "code": code,
+        "message": message,
+        "refresh": refresh,
+    })
+}
+
 /// Landing page that lists open targets (filled client-side from `/json/list`).
 pub const INDEX_HTML: &str = r#"<!DOCTYPE html>
 <html lang="en">

@@ -115,7 +115,7 @@ The profile scenario is not part of routine CI because it needs external network
 
 - CDP subset for scraping: Target, Page.navigate, Runtime.evaluate + remote objects, DOM queries, Network cookies/headers, Fetch interception, Input via JS dispatch, Hyperion.Profile.*
 - Isolated persistent/ephemeral profiles (encrypted local or S3 payloads, optional Postgres catalog)
-- Operations dashboard at `/ui/` (session cookie + CSRF)
+- Operations dashboard at `/ui/` (session cookie + CSRF), including an interactive DOM-mirror profile browser for locally owned profiles
 - Prometheus metrics, `/health/live` (unauthenticated), `/health/ready`
 
 ## Explicit limitations
@@ -129,7 +129,7 @@ See [docs/cdp-matrix.md](docs/cdp-matrix.md).
 
 ## Security posture
 
-Trusted operators, untrusted page URLs. Non-loopback binds fail closed without `HYPERION_AUTH_TOKEN`. SSRF denies private/metadata destinations unless explicitly overridden. Previews are sandboxed iframes. Report vulnerabilities per [SECURITY.md](SECURITY.md). Details: [docs/security.md](docs/security.md).
+Trusted operators, untrusted page URLs. Non-loopback binds fail closed without `HYPERION_AUTH_TOKEN`. SSRF denies private/metadata destinations unless explicitly overridden. Previews are sandboxed DOM/HTML mirrors, not pixel frames. Report vulnerabilities per [SECURITY.md](SECURITY.md). Details: [docs/security.md](docs/security.md).
 
 ## Architecture
 

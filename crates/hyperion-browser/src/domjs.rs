@@ -97,6 +97,7 @@ impl Default for PageEnv {
 #[derive(Default)]
 pub struct DomBridgeState {
     pub focused: Option<i32>,
+    pub hovered: Option<i32>,
     /// Incremented on every mutating op so preview can detect changes.
     pub generation: u64,
     /// Event listener registration counts (informational).
@@ -342,6 +343,7 @@ fn dispatch(
             state.borrow_mut().focused = Some(id);
             Ok(json!({}))
         }
+        "activeElement" => Ok(json!({ "nodeId": state.borrow().focused })),
         "addEventListener" => {
             let node = resolve_node(req, ids)?;
             let id = ids.borrow_mut().ensure(node);

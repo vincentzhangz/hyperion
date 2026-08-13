@@ -8,7 +8,7 @@ pub mod domjs;
 pub mod page;
 
 pub use domjs::{DomBridgeState, NodeIdMap, PageEnv};
-pub use page::Page;
+pub use page::{InteractionOutcome, Page};
 
 use hyperion_net::client::{HttpClient, HttpClientOptions};
 use hyperion_net::error::Result;

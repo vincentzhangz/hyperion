@@ -11,7 +11,7 @@ use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc;
 use std::time::Instant;
 
-use hyperion_browser::{BrowserContext, Page};
+use hyperion_browser::{BrowserContext, InteractionOutcome, Page};
 use hyperion_config::Config;
 use hyperion_dashboard::DashboardState;
 use hyperion_dom::{NodeData, NodeId};
@@ -21,7 +21,7 @@ use hyperion_profile::{ProfileId, ProfileKind, ProfileManager};
 use serde_json::{Value, json};
 
 use crate::connection::{CdpRequest, OutMsg, Sender};
-use crate::preview;
+use crate::preview::{self, PreviewClientMsg};
 use crate::protocol::{self, ErrorObj};
 
 /// Configuration for the CDP server.
@@ -478,6 +478,17 @@ impl CdpServer {
                 self.store_lifecycle_gauges();
                 Self::send(reply, Ok(Value::Null));
             }
+            CdpRequest::PreviewCommand {
+                target_id,
+                profile_id,
+                msg,
+                reply,
+            } => {
+                let result = self
+                    .handle_preview_command(&target_id, profile_id.as_deref(), msg)
+                    .await;
+                Self::send(reply, result);
+            }
             CdpRequest::Shutdown { reply } => {
                 self.begin_shutdown();
                 Self::send(reply, Ok(json!({ "ok": true })));
@@ -488,7 +499,7 @@ impl CdpServer {
                 method,
                 reply,
             } => {
-                let result = self.dashboard_api(&path, query.as_deref(), &method);
+                let result = self.dashboard_api(&path, query.as_deref(), &method).await;
                 Self::send(reply, result);
             }
         }
@@ -624,7 +635,7 @@ impl CdpServer {
 
             "Input.dispatchKeyEvent" => self.input_key(&target_id, &req.params),
             "Input.insertText" => self.input_insert_text(&target_id, &req.params),
-            "Input.dispatchMouseEvent" => self.input_mouse(&target_id, &req.params),
+            "Input.dispatchMouseEvent" => self.input_mouse(&target_id, &req.params).await,
 
             "Log.enable" => self.log_enable(&eff_session),
             "Log.disable" => self.log_disable(&eff_session),
@@ -1776,23 +1787,19 @@ impl CdpServer {
     // ------------------------------------------------------------------
 
     fn input_key(&self, target_id: &str, params: &Value) -> Result<Value, ErrorObj> {
-        let text = params
-            .get("text")
-            .or_else(|| params.get("key"))
-            .and_then(Value::as_str)
-            .unwrap_or("");
+        let text = params.get("text").and_then(Value::as_str).unwrap_or("");
+        let key = params.get("key").and_then(Value::as_str).unwrap_or(text);
         let ty = params
             .get("type")
             .and_then(Value::as_str)
             .unwrap_or("keyDown");
-        if ty == "keyDown" || ty == "rawKeyDown" || ty == "char" {
-            if let Some(focus) = self.page_ref(target_id)?.focused_node_id() {
-                let _ = self.page_ref(target_id)?.evaluate_js(&format!(
-                    "(function(){{var n=__hyperion_wrapNode({focus});if(n){{n.value=(n.value||'')+{text};n.dispatchEvent({{type:'input',bubbles:true}});}}}})()",
-                    text = serde_json::to_string(text).unwrap_or_else(|_| "\"\"".into()),
-                ));
-            }
-        }
+        let node_id = params
+            .get("nodeId")
+            .and_then(Value::as_i64)
+            .map(|n| n as i32);
+        let _ = self
+            .page_ref(target_id)?
+            .dispatch_key(node_id, ty, key, text);
         Ok(json!({}))
     }
 
@@ -1801,17 +1808,49 @@ impl CdpServer {
         self.input_key(target_id, &json!({ "type": "char", "text": text }))
     }
 
-    fn input_mouse(&self, target_id: &str, params: &Value) -> Result<Value, ErrorObj> {
+    async fn input_mouse(&mut self, target_id: &str, params: &Value) -> Result<Value, ErrorObj> {
         let ty = params.get("type").and_then(Value::as_str).unwrap_or("");
+        let node_id = params
+            .get("nodeId")
+            .and_then(Value::as_i64)
+            .map(|n| n as i32);
+        if ty == "mouseMoved" || ty == "mouseover" {
+            if let Some(id) = node_id {
+                let _ = self.page_ref(target_id)?.dispatch_hover(id);
+            }
+            return Ok(json!({}));
+        }
         if ty == "mousePressed" || ty == "click" {
-            // Without hit-testing, dispatch click on the focused node or document.body.
-            let _ = self.page_ref(target_id)?.evaluate_js(
-                r#"(function(){
+            let outcome = {
+                let page = self.page_ref(target_id)?;
+                let id = node_id.or_else(|| page.focused_node_id());
+                if let Some(id) = id {
+                    page.dispatch_click(id)
+                } else {
+                    let _ = page.evaluate_js(
+                        r#"(function(){
                     var n = document.activeElement || document.body;
                     if (n && n.click) n.click();
                     else if (n) n.dispatchEvent({type:'click',bubbles:true});
                 })()"#,
-            );
+                    );
+                    Ok(InteractionOutcome::Applied)
+                }
+            };
+            match outcome {
+                Ok(InteractionOutcome::Navigate(url)) => {
+                    return self.page_navigate(target_id, &json!({ "url": url })).await;
+                }
+                Ok(InteractionOutcome::Stale) => {
+                    return Err(ErrorObj::named(
+                        "stale_node",
+                        "preview node is no longer valid",
+                    ));
+                }
+                Ok(InteractionOutcome::Applied) => {}
+                Err(e) => return Err(ErrorObj::server(e)),
+            }
+            self.push_preview_snapshot(target_id);
         }
         Ok(json!({}))
     }
@@ -2200,6 +2239,7 @@ impl CdpServer {
             "title": target.title,
             "html": html,
             "generation": page.bridge_generation(),
+            "profileId": target.profile_id,
         }))
     }
 
@@ -2231,6 +2271,177 @@ impl CdpServer {
         let text = serde_json::to_string(&msg).unwrap_or_default();
         for out in outs {
             let _ = out.try_send(OutMsg::Text(text.clone()));
+        }
+    }
+
+    async fn handle_preview_command(
+        &mut self,
+        target_id: &str,
+        profile_id: Option<&str>,
+        msg: PreviewClientMsg,
+    ) -> Result<Value, ErrorObj> {
+        let PreviewClientMsg::Input {
+            id,
+            generation,
+            node_id,
+            action,
+            key,
+            text,
+            event_type,
+        } = msg
+        else {
+            return Ok(preview::preview_ack(0, 0));
+        };
+        let (is_page, target_profile) = match self.targets.get(target_id) {
+            Some(t) => (t.kind == TargetKind::Page, t.profile_id.clone()),
+            None => {
+                return Ok(preview::preview_error(
+                    Some(id),
+                    "target_not_found",
+                    "no such target",
+                    false,
+                ));
+            }
+        };
+        if let Some(pid) = profile_id
+            && pid != target_profile
+        {
+            return Ok(preview::preview_error(
+                Some(id),
+                "target_profile_mismatch",
+                "target does not belong to this profile",
+                false,
+            ));
+        }
+        if !is_page {
+            return Ok(preview::preview_error(
+                Some(id),
+                "target_not_found",
+                "not a page target",
+                false,
+            ));
+        }
+        let page_gen = self
+            .page_ref(target_id)
+            .ok()
+            .map(|p| p.bridge_generation())
+            .unwrap_or(0);
+        if generation != 0 && generation != page_gen {
+            return Ok(preview::preview_error(
+                Some(id),
+                "stale_document",
+                "preview snapshot is stale",
+                true,
+            ));
+        }
+        if let Some(t) = self.targets.get_mut(target_id) {
+            t.last_active = Instant::now();
+        }
+        let outcome = {
+            let page = match self.page_ref(target_id) {
+                Ok(p) => p,
+                Err(_) => {
+                    return Ok(preview::preview_error(
+                        Some(id),
+                        "target_not_found",
+                        "page not ready",
+                        true,
+                    ));
+                }
+            };
+            match action.as_str() {
+                "hover" | "mousemove" => {
+                    let Some(nid) = node_id else {
+                        return Ok(preview::preview_error(
+                            Some(id),
+                            "bad_request",
+                            "missing nodeId",
+                            false,
+                        ));
+                    };
+                    page.dispatch_hover(nid)
+                }
+                "focus" => {
+                    let Some(nid) = node_id else {
+                        return Ok(preview::preview_error(
+                            Some(id),
+                            "bad_request",
+                            "missing nodeId",
+                            false,
+                        ));
+                    };
+                    page.dispatch_focus(nid)
+                }
+                "click" => {
+                    let Some(nid) = node_id else {
+                        return Ok(preview::preview_error(
+                            Some(id),
+                            "bad_request",
+                            "missing nodeId",
+                            false,
+                        ));
+                    };
+                    page.dispatch_click(nid)
+                }
+                "text" => page.dispatch_text(node_id, text.as_deref().unwrap_or("")),
+                "key" => page.dispatch_key(
+                    node_id,
+                    event_type.as_deref().unwrap_or("keydown"),
+                    key.as_deref().unwrap_or(""),
+                    text.as_deref().unwrap_or(""),
+                ),
+                "scroll" => {
+                    let Some(nid) = node_id else {
+                        return Ok(preview::preview_error(
+                            Some(id),
+                            "bad_request",
+                            "missing nodeId",
+                            false,
+                        ));
+                    };
+                    page.dispatch_scroll(nid)
+                }
+                other => {
+                    return Ok(preview::preview_error(
+                        Some(id),
+                        "bad_request",
+                        &format!("unknown action: {other}"),
+                        false,
+                    ));
+                }
+            }
+        };
+        match outcome {
+            Ok(InteractionOutcome::Stale) => Ok(preview::preview_error(
+                Some(id),
+                "stale_node",
+                "node is no longer valid",
+                true,
+            )),
+            Ok(InteractionOutcome::Navigate(url)) => {
+                if let Err(e) = self.page_navigate(target_id, &json!({ "url": url })).await {
+                    return Ok(preview::preview_error(
+                        Some(id),
+                        "navigate",
+                        &e.message,
+                        true,
+                    ));
+                }
+                let generation = self
+                    .page_ref(target_id)
+                    .map(|p| p.bridge_generation())
+                    .unwrap_or(0);
+                Ok(preview::preview_ack(id, generation))
+            }
+            Ok(InteractionOutcome::Applied) => {
+                self.push_preview_snapshot(target_id);
+                let generation = self
+                    .page_ref(target_id)
+                    .map(|p| p.bridge_generation())
+                    .unwrap_or(0);
+                Ok(preview::preview_ack(id, generation))
+            }
+            Err(e) => Ok(preview::preview_error(Some(id), "server", &e, false)),
         }
     }
 
@@ -2497,12 +2708,18 @@ impl CdpServer {
             .map_err(|e| ErrorObj::server(e.to_string()))?
             .into_iter()
             .map(|p| {
+                let local = p
+                    .owner_node
+                    .as_deref()
+                    .map(|o| o == self.config.node_id)
+                    .unwrap_or(true);
                 json!({
                     "id": p.id.as_str(),
                     "name": p.name,
                     "kind": match p.kind { ProfileKind::Persistent => "persistent", ProfileKind::Ephemeral => "ephemeral" },
                     "owner_node": p.owner_node,
                     "version": p.version,
+                    "local": local,
                 })
             })
             .collect::<Vec<_>>();
@@ -2523,6 +2740,7 @@ impl CdpServer {
                     "kind": "ephemeral",
                     "owner_node": self.config.node_id,
                     "loaded": true,
+                    "local": true,
                 }));
             }
         }
@@ -2640,7 +2858,7 @@ impl CdpServer {
         }
     }
 
-    fn dashboard_api(
+    async fn dashboard_api(
         &mut self,
         path: &str,
         query: Option<&str>,
@@ -2648,11 +2866,22 @@ impl CdpServer {
     ) -> Result<Value, ErrorObj> {
         let params = query_map(query);
         let q = params.get("q").cloned();
+        if path.ends_with("/targets") && method.eq_ignore_ascii_case("POST") {
+            return self.dashboard_targets(&params).await;
+        }
+        if path.ends_with("/profiles/detail") {
+            return self.dashboard_profile_detail(&params);
+        }
         if path.ends_with("/profiles") && method.eq_ignore_ascii_case("POST") {
             return match params.get("action").map(String::as_str) {
                 Some("create") => self.profile_create(&json!({
                     "name": params.get("name").cloned().unwrap_or_else(|| "profile".into()),
                 })),
+                Some("open") => {
+                    let id = params.get("id").cloned().unwrap_or_default();
+                    self.ensure_local_profile(&id)?;
+                    Ok(json!({ "ok": true }))
+                }
                 Some("flush") => self.profile_flush(&json!({
                     "profileId": params.get("id").cloned().unwrap_or_default(),
                 })),
@@ -2722,6 +2951,160 @@ impl CdpServer {
             Ok(json!({ "events": self.dashboard.events() }))
         } else {
             Err(ErrorObj::method_not_found(path))
+        }
+    }
+
+    fn ensure_local_profile(&mut self, id: &str) -> Result<(), ErrorObj> {
+        let pid = ProfileId(id.to_owned());
+        if let Ok(Some(rec)) = self.profiles.catalog_get(&pid) {
+            if rec.deleted {
+                return Err(ErrorObj::named("profile_not_found", "profile deleted"));
+            }
+            if let Some(owner) = rec.owner_node.as_deref()
+                && owner != self.config.node_id
+            {
+                return Err(ErrorObj::named(
+                    "not_local",
+                    format!("profile is owned by {owner}"),
+                ));
+            }
+        }
+        if self.profiles.get(&pid).is_some() {
+            self.ensure_profile_context(&pid);
+            return Ok(());
+        }
+        match self.profiles.open(&pid) {
+            Ok(()) => {
+                self.ensure_profile_context(&pid);
+                Ok(())
+            }
+            Err(hyperion_profile::ProfileError::LeaseHeld(owner)) => Err(ErrorObj::named(
+                "not_local",
+                format!("profile is owned by {owner}"),
+            )),
+            Err(hyperion_profile::ProfileError::NotFound)
+            | Err(hyperion_profile::ProfileError::Deleted) => {
+                Err(ErrorObj::named("profile_not_found", "unknown profile"))
+            }
+            Err(e) => Err(ErrorObj::server(e.to_string())),
+        }
+    }
+
+    fn require_profile_target(&self, profile_id: &str, target_id: &str) -> Result<(), ErrorObj> {
+        let t = self
+            .targets
+            .get(target_id)
+            .ok_or_else(|| ErrorObj::named("target_not_found", "no such target"))?;
+        if t.kind != TargetKind::Page {
+            return Err(ErrorObj::named("target_not_found", "not a page target"));
+        }
+        if t.profile_id != profile_id {
+            return Err(ErrorObj::named(
+                "target_profile_mismatch",
+                "target does not belong to this profile",
+            ));
+        }
+        Ok(())
+    }
+
+    fn dashboard_profile_detail(
+        &mut self,
+        params: &HashMap<String, String>,
+    ) -> Result<Value, ErrorObj> {
+        let id = params.get("id").cloned().unwrap_or_default();
+        if id.is_empty() {
+            return Err(ErrorObj::named("profile_not_found", "missing profile id"));
+        }
+        self.ensure_local_profile(&id)?;
+        let pid = ProfileId(id.clone());
+        let loaded = self.profiles.get(&pid);
+        let name = loaded.map(|p| p.name.clone()).unwrap_or_default();
+        let kind = loaded
+            .map(|p| match p.kind {
+                ProfileKind::Persistent => "persistent",
+                ProfileKind::Ephemeral => "ephemeral",
+            })
+            .unwrap_or("persistent");
+        let targets: Vec<Value> = self
+            .targets
+            .iter()
+            .filter(|(_, t)| t.kind == TargetKind::Page && t.profile_id == id)
+            .map(|(tid, t)| {
+                json!({
+                    "id": tid,
+                    "url": t.url,
+                    "title": t.title,
+                    "profileId": t.profile_id,
+                })
+            })
+            .collect();
+        Ok(json!({
+            "id": id,
+            "name": name,
+            "kind": kind,
+            "local": true,
+            "owner_node": self.config.node_id,
+            "targets": targets,
+        }))
+    }
+
+    async fn dashboard_targets(
+        &mut self,
+        params: &HashMap<String, String>,
+    ) -> Result<Value, ErrorObj> {
+        let action = params.get("action").map(String::as_str).unwrap_or("");
+        let profile_id = params
+            .get("profileId")
+            .cloned()
+            .or_else(|| params.get("profile_id").cloned())
+            .unwrap_or_default();
+        if profile_id.is_empty() {
+            return Err(ErrorObj::named("profile_not_found", "missing profileId"));
+        }
+        match action {
+            "create" => {
+                self.ensure_local_profile(&profile_id)?;
+                let url = params
+                    .get("url")
+                    .cloned()
+                    .unwrap_or_else(|| "about:blank".into());
+                let id = self.spawn_page_target(&url, Some(&profile_id)).await?;
+                let target = self.targets.get(&id);
+                Ok(json!({
+                    "id": id,
+                    "targetId": id,
+                    "url": target.map(|t| t.url.clone()).unwrap_or(url),
+                    "title": target.map(|t| t.title.clone()).unwrap_or_default(),
+                    "profileId": profile_id,
+                }))
+            }
+            "navigate" => {
+                let tid = params.get("id").cloned().unwrap_or_default();
+                let url = params.get("url").cloned().unwrap_or_default();
+                self.require_profile_target(&profile_id, &tid)?;
+                self.page_navigate(&tid, &json!({ "url": url })).await?;
+                let target = self.targets.get(&tid);
+                Ok(json!({
+                    "id": tid,
+                    "url": target.map(|t| t.url.clone()).unwrap_or(url),
+                    "title": target.map(|t| t.title.clone()).unwrap_or_default(),
+                    "profileId": profile_id,
+                }))
+            }
+            "close" => {
+                let tid = params.get("id").cloned().unwrap_or_default();
+                self.require_profile_target(&profile_id, &tid)?;
+                Ok(json!({ "closed": self.close_target(&tid) }))
+            }
+            "activate" => {
+                let tid = params.get("id").cloned().unwrap_or_default();
+                self.require_profile_target(&profile_id, &tid)?;
+                if let Some(t) = self.targets.get_mut(&tid) {
+                    t.last_active = Instant::now();
+                }
+                Ok(json!({ "ok": true }))
+            }
+            _ => Err(ErrorObj::invalid_params("unknown target action")),
         }
     }
 
